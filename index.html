@@ -79,32 +79,23 @@
 <div class="wrap">
   <div class="eyebrow">Estudio · Armario de expedientes</div>
   <h1 class="font-display">Localizador de expedientes</h1>
-
   <div class="search">
     <input type="text" id="searchInput" class="font-mono" placeholder="N° de expediente o apellido" autocomplete="off" />
     <button type="button" class="btn-primary" id="searchBtn">Buscar</button>
   </div>
-
   <div id="resultArea"></div>
-
   <div id="shelvesArea"></div>
-
   <div class="legend" id="legendArea"></div>
-
   <div class="section-header">
     <div class="eyebrow" id="countLabel">Todos los expedientes (0)</div>
     <div style="display:flex; gap:8px;">
-      <button class="btn-primary" style="padding:8px 14px; font-size:13px; background:#5B5647;" id="importBtn">Cargar planilla</button>
       <button class="btn-primary" style="padding:8px 14px; font-size:13px;" id="newBtn">+ Nuevo</button>
     </div>
   </div>
-
   <div id="emptyMsg" style="display:none; color:#8A8272; font-size:14px;">Todavía no cargaste expedientes. Usá "+ Nuevo" para empezar.</div>
   <div id="listArea"></div>
-
   <div id="notice" class="notice" style="display:none;"></div>
 </div>
-
 <div class="modal-overlay" id="modalOverlay">
   <div class="modal">
     <h2 class="font-display" id="modalTitle">Nuevo expediente</h2>
@@ -120,7 +111,6 @@
     </div>
   </div>
 </div>
-
 <script>
 const CATEGORIES = [
   { id: "jud1", name: "Judicializados 1", color: "#B8621B" },
@@ -140,6 +130,7 @@ const SHELF_CATEGORIES = {
   4: ["notificar", "derivar"],
   5: [],
 };
+// REEMPLAZAR por la URL /exec de tu Apps Script (backend del Localizador)
 const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbz23jwAX2e95gNrdF4xrV7j4wE20nckpSeIr5dt6TenclwyvTV6E1vgIA2AuYDqyHTq/exec";
 const ESTADO_TO_CATEGORIA = {
   "judicializados 1": "jud1",
@@ -163,6 +154,12 @@ let currentQuery = "";
 let result = null; // null | 'not-found' | expediente object
 let editingId = null;
 
+// ==========================================
+// LISTA PRECARGADA (los 150 originales), directo en el HTML.
+// Se muestran de inmediato al abrir la página, sin depender del backend.
+// Si editás uno de estos desde la app, pasa a guardarse en la Sheet real
+// y desde ese momento ya es un registro "vivo" (editable/borrable).
+// ==========================================
 const IMPORT_DATA = [];
 function addBatch(entries, categoria, estante) {
   entries.forEach(([numero, caratula]) => IMPORT_DATA.push({ numero, caratula, categoria, estante }));
@@ -237,23 +234,20 @@ addBatch([
   ["241/2023","SUBELZA IBER ARIEL"],["1237/2024","TARIFA, DARIO CARLOS"],["893/2024","ZERPA ADRIAN"]
 ], "derivar", 4);
 
-async function importPlanilla() {
-  const existingNums = new Set(expedientes.map(x => x.numero.trim().toLowerCase()));
-  let added = 0, skipped = 0;
-  showNotice(`Cargando ${IMPORT_DATA.length} expedientes a la planilla, esto puede tardar un minuto...`);
-  for (const item of IMPORT_DATA) {
-    const key = item.numero.trim().toLowerCase();
-    if (existingNums.has(key)) { skipped++; continue; }
-    existingNums.add(key);
-    await postToSheet("add", {
-      nombre: item.caratula,
-      expediente: item.numero,
-      estado: CATEGORIA_TO_ESTADO[item.categoria],
-    });
-    added++;
-  }
-  await loadData();
-  showNotice(`Se cargaron ${added} expedientes a la planilla. ${skipped ? skipped + " ya existían y se omitieron." : ""}`);
+/**
+ * Convierte la lista precargada al mismo formato que usan los expedientes
+ * que vienen de la Sheet. Los precargados tienen fila = null (todavía no
+ * existen como fila real), con un id sintético "s0", "s1", etc.
+ */
+function expedientesPrecargados() {
+  return IMPORT_DATA.map((item, i) => ({
+    id: "s" + i,
+    fila: null,
+    numero: item.numero,
+    caratula: item.caratula,
+    categoria: item.categoria,
+    estante: item.estante,
+  }));
 }
 
 function categoryOf(id) {
@@ -269,32 +263,48 @@ function loadViaJSONP(url) {
     script.onerror = () => { cleanup(); reject(new Error("jsonp error")); };
     script.src = url + (url.includes("?") ? "&" : "?") + "callback=" + callbackName;
     document.body.appendChild(script);
+    // si el backend no responde en 8 segundos, no dejamos la app colgada
+    setTimeout(() => reject(new Error("timeout")), 8000);
   });
 }
 
+/**
+ * Carga la lista: arranca SIEMPRE con los precargados (instantáneo),
+ * y en segundo plano intenta traer lo que haya en la Sheet real.
+ * Si un expediente de la Sheet tiene el mismo número que uno precargado,
+ * el de la Sheet "gana" (es la versión editada/persistida).
+ */
 async function loadData() {
+  const precargados = expedientesPrecargados();
+  expedientes = precargados;
+  loaded = true;
+  renderAll();
+
   try {
     const rows = await loadViaJSONP(APPS_SCRIPT_URL);
-    expedientes = rows.map(r => {
+    const deSheet = rows.map(r => {
       const catId = ESTADO_TO_CATEGORIA[(r.estado || "").trim().toLowerCase()] || "archivado";
       return {
         id: String(r.fila),
         fila: r.fila,
         numero: String(r.expediente || ""),
         caratula: r.nombre || "",
-        dni: r.dni || "",
-        domicilio: r.domicilio || "",
-        responsable: r.responsable || "",
-        codigo: r.codigo || "",
         categoria: catId,
         estante: CATEGORIA_TO_ESTANTE[catId] || 1,
       };
     });
+
+    const numerosEnSheet = new Set(deSheet.map(x => x.numero.trim().toLowerCase()));
+    const precargadosSinDuplicar = precargados.filter(x => !numerosEnSheet.has(x.numero.trim().toLowerCase()));
+
+    expedientes = [...deSheet, ...precargadosSinDuplicar];
+    renderAll();
   } catch (e) {
-    showNotice("No se pudo conectar con la planilla de Google. Revisá tu conexión y volvé a intentar.");
+    // No se pudo conectar con la Sheet: seguimos mostrando los precargados
+    // igual, sin colgar la app. Los cambios nuevos no se van a poder guardar
+    // hasta que el backend esté disponible.
+    showNotice("No se pudo conectar con la planilla en este momento — se muestran los expedientes precargados. Los cambios nuevos no se guardarán hasta reconectar.");
   }
-  loaded = true;
-  renderAll();
 }
 
 async function postToSheet(action, payload) {
@@ -332,7 +342,7 @@ function renderResult() {
   if (result === "not-found") {
     const div = document.createElement("div");
     div.className = "card result-notfound";
-    div.innerHTML = `<p style="margin:0;">No se encontró ningún expediente para <span class="font-mono">${escapeHtml(currentQuery)}</span>.</p>`;
+    div.innerHTML = <p style="margin:0;">No se encontró ningún expediente para <span class="font-mono">${escapeHtml(currentQuery)}</span>.</p>;
     const btn = document.createElement("button");
     btn.className = "btn-link";
     btn.style.marginTop = "10px";
@@ -343,7 +353,7 @@ function renderResult() {
   } else if (result && result.multiple) {
     const div = document.createElement("div");
     div.className = "card";
-    div.innerHTML = `<p style="margin:0 0 8px; font-size:14px; color:#5B5647;">Hay ${result.multiple.length} expedientes que coinciden con "${escapeHtml(currentQuery)}":</p>`;
+    div.innerHTML = <p style="margin:0 0 8px; font-size:14px; color:#5B5647;">Hay ${result.multiple.length} expedientes que coinciden con "${escapeHtml(currentQuery)}":</p>;
     result.multiple.forEach(exp => {
       const cat = categoryOf(exp.categoria);
       const item = document.createElement("div");
@@ -356,7 +366,7 @@ function renderResult() {
       item.innerHTML = `
         <span class="legend-dot" style="background:${cat.color}"></span>
         <div style="flex:1;">
-          <div class="font-mono" style="font-size:14px;">${exp.codigo ? escapeHtml(exp.codigo) + " · " : ""}${escapeHtml(exp.numero)}</div>
+          <div class="font-mono" style="font-size:14px;">${escapeHtml(exp.numero)}</div>
           <div style="font-size:12px; color:#8A8272;">${escapeHtml(exp.caratula || "")} · Estante ${exp.estante}</div>
         </div>
       `;
@@ -368,11 +378,11 @@ function renderResult() {
     const cat = categoryOf(result.categoria);
     const div = document.createElement("div");
     div.className = "card result-found";
-    div.style.border = `1px solid ${cat.color}`;
+    div.style.border = 1px solid ${cat.color};
     div.innerHTML = `
       <span class="swatch" style="background:${cat.color}"></span>
       <div style="flex:1;">
-        <div class="font-mono" style="font-weight:600;">${result.codigo ? escapeHtml(result.codigo) + " · " : ""}${escapeHtml(result.numero)} — Estante ${result.estante}</div>
+        <div class="font-mono" style="font-weight:600;">${escapeHtml(result.numero)} — Estante ${result.estante}</div>
         <div style="font-size:14px; color:#5B5647;">${escapeHtml(cat.name)}${result.caratula ? " · " + escapeHtml(result.caratula) : ""}</div>
       </div>
     `;
@@ -392,22 +402,18 @@ function renderShelves() {
     const cats = SHELF_CATEGORIES[n] || [];
     const active = result && result !== "not-found" && !result.multiple && result.estante === n;
     const dim = result && result !== "not-found" && !result.multiple && !active;
-
     const shelf = document.createElement("div");
     shelf.className = "shelf" + (active ? " active" : "") + (dim ? " dim" : "");
     shelf.style.padding = "8px";
-
     const label = document.createElement("div");
     label.className = "shelf-label font-mono";
-    label.textContent = `Estante ${n}`;
+    label.textContent = Estante ${n};
     shelf.appendChild(label);
-
     const halves = document.createElement("div");
     halves.style.display = "flex";
     halves.style.gap = "4px";
     halves.style.flex = "1";
     halves.style.height = "44px";
-
     if (cats.length === 0) {
       const empty = document.createElement("div");
       empty.className = "empty-shelf";
@@ -439,7 +445,7 @@ function renderShelves() {
           half.style.outline = "3px solid #22201B";
           half.style.outlineOffset = "-3px";
         }
-        half.innerHTML = `<span>${escapeHtml(cat.name)}</span><span class="font-mono">${count}</span>`;
+        half.innerHTML = <span>${escapeHtml(cat.name)}</span><span class="font-mono">${count}</span>;
         halves.appendChild(half);
       });
     }
@@ -454,13 +460,13 @@ function renderLegend() {
   CATEGORIES.forEach(c => {
     const item = document.createElement("div");
     item.className = "legend-item";
-    item.innerHTML = `<span class="legend-dot" style="background:${c.color}"></span>${escapeHtml(c.name)}`;
+    item.innerHTML = <span class="legend-dot" style="background:${c.color}"></span>${escapeHtml(c.name)};
     area.appendChild(item);
   });
 }
 
 function renderList() {
-  document.getElementById("countLabel").textContent = `Todos los expedientes (${expedientes.length})`;
+  document.getElementById("countLabel").textContent = Todos los expedientes (${expedientes.length});
   document.getElementById("emptyMsg").style.display = (loaded && expedientes.length === 0) ? "block" : "none";
   const area = document.getElementById("listArea");
   area.innerHTML = "";
@@ -472,7 +478,7 @@ function renderList() {
     row.innerHTML = `
       <span class="legend-dot" style="background:${cat.color}"></span>
       <div class="info">
-        <div class="num font-mono">${exp.codigo ? escapeHtml(exp.codigo) + " · " : ""}${escapeHtml(exp.numero)}</div>
+        <div class="num font-mono">${escapeHtml(exp.numero)}</div>
         <div class="meta">Estante ${exp.estante} · ${escapeHtml(cat.name)}</div>
       </div>
     `;
@@ -480,12 +486,17 @@ function renderList() {
     editBtn.className = "btn-link";
     editBtn.textContent = "Editar";
     editBtn.onclick = () => openForm(exp);
-    const delBtn = document.createElement("button");
-    delBtn.className = "btn-link danger";
-    delBtn.textContent = "Borrar";
-    delBtn.onclick = () => deleteExp(exp.id);
     row.appendChild(editBtn);
-    row.appendChild(delBtn);
+
+    // Solo se puede borrar lo que realmente existe como fila en la Sheet.
+    // Los precargados (fila === null) no tienen de dónde borrarse todavía.
+    if (exp.fila) {
+      const delBtn = document.createElement("button");
+      delBtn.className = "btn-link danger";
+      delBtn.textContent = "Borrar";
+      delBtn.onclick = () => deleteExp(exp.id);
+      row.appendChild(delBtn);
+    }
     area.appendChild(row);
   });
 }
@@ -511,7 +522,7 @@ function closeForm() {
 
 async function deleteExp(id) {
   const exp = expedientes.find(x => x.id === id);
-  if (!exp) return;
+  if (!exp || !exp.fila) return;
   await postToSheet("delete", { fila: exp.fila });
   if (result && result !== "not-found" && !result.multiple && result.id === id) result = "not-found";
   await loadData();
@@ -546,26 +557,23 @@ function init() {
     }
     renderAll();
   }
+
   function selectResult(exp) {
     result = exp;
     renderAll();
   }
   window.__selectResult = selectResult;
+
   document.getElementById("searchBtn").addEventListener("click", doSearch);
   document.getElementById("searchInput").addEventListener("keydown", (e) => {
     if (e.key === "Enter") doSearch();
   });
-
   document.getElementById("searchInput").addEventListener("input", () => {
     result = null;
     renderResult();
     renderShelves();
   });
-
   document.getElementById("newBtn").addEventListener("click", () => openForm(null, document.getElementById("searchInput").value.trim()));
-  document.getElementById("importBtn").addEventListener("click", () => {
-    importPlanilla();
-  });
   document.getElementById("cancelBtn").addEventListener("click", closeForm);
 
   async function saveExpediente() {
@@ -575,12 +583,17 @@ function init() {
     const categoria = document.getElementById("f_categoria").value;
     const estado = CATEGORIA_TO_ESTADO[categoria];
 
-    if (editingId) {
+    const editandoUnPrecargado = editingId && String(editingId).startsWith("s");
+
+    if (editingId && !editandoUnPrecargado) {
+      // Edición de un registro que YA existe como fila real en la Sheet
       const exp = expedientes.find(x => x.id === editingId);
-      await postToSheet("update", { fila: exp.fila, nombre: caratula, estado });
+      await postToSheet("update", { fila: exp.fila, expediente: numero, nombre: caratula, estado });
     } else {
+      // Alta nueva (o edición de un precargado, que pasa a convertirse en fila real)
       await postToSheet("add", { nombre: caratula, expediente: numero, estado });
     }
+
     closeForm();
     await loadData();
     if (currentQuery) {
@@ -592,7 +605,6 @@ function init() {
 
   loadData();
 }
-
 init();
 </script>
 </body>
